@@ -1,0 +1,2 @@
+FROM ./models/embeddinggemma-2-UD-Q4_K_XL.gguf
+PARAMETER num_ctx 8192

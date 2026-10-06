@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Environment and Secrets
+.env
+*.env.local
+*.pem
+*.key
+
+# Runtime and Log Files
+prompts.log
+bot.log
+bot_output.log
+bot.pid
+*.log
+
+# Databases & local dynamic caches
+rag_memory.db
+rag_memory.db-journal
+rag_memory.db-wal
+rag_memory.db-shm
+
+# Transcripts, Chat Logs, and Memory Lore
+general_memory.json
+general_memory*.json
+current_chunk_raw.txt
+current_chunk_meta.json
+new_chunk_summary.txt
+new_overall_summary.txt
+subagent_output.txt
+walkthrough.md
+last_prompt_system.txt
+real_system_prompt*.txt
+memory_archive/
+
+# Memory Update & Summarization Scripts (contain server chat logs)
+build_iteration_*.py
+build_summaries*.py
+create_summaries.py
+generate_summaries.py
+write_daily_memory.py
+write_summaries.py
+write_summary_files.py
+apply_memory_update.py
+check_anchors.py
+compress_memory.py
+
+# Stats Website Dynamic Data & Builds
+stats_website/dist/
+stats_website/web/data.json
+stats_website/web/index.html
+stats_website/server.log
+stats_website/__pycache__/
+
+# OS artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+stats_website/aliases.json
+
+# Model weights & binaries
+models/
+*.gguf
