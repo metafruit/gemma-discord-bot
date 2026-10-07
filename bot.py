@@ -32,6 +32,12 @@ from bs4 import BeautifulSoup
 import rag_store
 
 try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except Exception:
+    pass
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -245,10 +251,15 @@ def format_discord_emojis(text: str, guild: discord.Guild | None = None) -> str:
     return re.sub(pattern, replace_emoji_match, text)
 
 MAX_HISTORY_PAIRS  = 20
-CONTEXT_MESSAGES   = 50
+CONTEXT_MESSAGES   = int(os.environ.get("CONTEXT_MESSAGES", "25"))
 AUTO_RESPONSE_THRESHOLD = 25
 AUTO_EVALUATE_SILENCE_MINUTES = 2
 DISCORD_MAX_LEN    = 1900
+
+# Visual image records and passive background viewer tracking
+visual_records_by_message: dict[int, list[dict]] = defaultdict(list)
+channel_visual_records: dict[int, list[dict]] = defaultdict(list)
+active_passive_view_tasks: dict[int, asyncio.Task] = {}
 AUTO_IDLE_REPLY_HOURS = float(os.environ.get("AUTO_IDLE_REPLY_HOURS", "1"))
 AUTO_IDLE_CHECK_SECONDS = int(os.environ.get("AUTO_IDLE_CHECK_SECONDS", "60"))
 AUTO_IDLE_CHANNEL_IDS = {
@@ -454,14 +465,247 @@ async def parse_media_with_gemini(
     return None
 
 
+# ── Visual Records & Passive Image Viewing ─────────────────────────────────────
+
+async def parse_image_with_ollama(b64_image: str, prompt: str = "Describe what is shown in this picture in detail.") -> str | None:
+    """Fallback vision parser using local Ollama model with image input."""
+    try:
+        messages = [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [b64_image]
+            }
+        ]
+        return await query_ollama_raw(messages, timeout=60.0, options={"temperature": 0.2})
+    except Exception as e:
+        print(f"Ollama vision parse error: {e}")
+        return None
+
+
+async def analyze_and_describe_image(
+    img_bytes: bytes,
+    mime_type: str,
+    filename: str,
+    context_hint: str = ""
+) -> str | None:
+    """Analyzes an image using Gemini multimodal if available, with Ollama vision fallback."""
+    prompt = (
+        f"Describe what is shown in this picture ({filename}) in detail (key subjects, text, objects, colors, atmosphere)."
+        + (f" Context: '{context_hint}'" if context_hint else "")
+    )
+    if GEMINI_API_KEY:
+        res = await parse_media_with_gemini(img_bytes, mime_type, prompt=prompt)
+        if res:
+            return res
+
+    b64_str = process_image_bytes(img_bytes)
+    if b64_str:
+        res = await parse_image_with_ollama(b64_str, prompt=prompt)
+        if res:
+            return res
+
+    return None
+
+
+def create_named_visual_record(
+    filename: str,
+    author_name: str,
+    message: discord.Message | discord.Interaction,
+    description: str,
+    b64_image: str | None = None
+) -> dict:
+    """Names a visual record and stores it in context data structures."""
+    msg_id = getattr(message, "id", 0)
+    created_at = getattr(message, "created_at", None) or discord.utils.utcnow()
+    timestamp_str = created_at.strftime("%I:%M %p")
+    channel_id = getattr(message, "channel_id", None) or (message.channel.id if hasattr(message, "channel") and message.channel else 0)
+    clean_fn = Path(filename).name if filename else "image"
+    record_name = f"Visual Record ({clean_fn} by {author_name})"
+    record = {
+        "record_name": record_name,
+        "filename": clean_fn,
+        "author": author_name,
+        "message_id": msg_id,
+        "channel_id": channel_id,
+        "timestamp": timestamp_str,
+        "description": description.strip(),
+        "b64_image": b64_image,
+        "created_at": created_at
+    }
+
+    # Store in per-message records
+    if msg_id:
+        visual_records_by_message[msg_id].append(record)
+
+    # Store in per-channel records (ordered most recent first, max 50)
+    if channel_id:
+        ch_records = channel_visual_records[channel_id]
+        ch_records.insert(0, record)
+        if len(ch_records) > 50:
+            channel_visual_records[channel_id] = ch_records[:50]
+
+    return record
+
+
+async def cancel_passive_image_viewing(channel_id: int, reason: str = "pertinent trigger"):
+    """Cancels any running passive image viewing task in the specified channel to prioritize a pertinent action."""
+    task = active_passive_view_tasks.get(channel_id)
+    if task and not task.done():
+        print(f"🛑 [Passive Image Viewing] Cancelling background task in channel {channel_id} due to {reason}!")
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    active_passive_view_tasks.pop(channel_id, None)
+
+
+async def passive_image_viewer(message: discord.Message):
+    """Passively views images in a non-trigger message in the background.
+    Sends all pictures through ordered from most recent to oldest,
+    and names a visual record for each that can be provided in context of 25 messages.
+    If a trigger arrives, this task is cancelled immediately to perform the more pertinent action."""
+    channel = message.channel
+    author_name = f"{message.author.display_name} ({message.author.name})"
+    ch_name = getattr(channel, "name", "DM")
+
+    try:
+        # Sort attachments from MOST RECENT TO OLDEST (higher attachment ID = uploaded later)
+        media_attachments = [
+            a for a in message.attachments
+            if get_media_mime_type(a)[1] in ("image", "video")
+        ]
+        media_attachments.sort(key=lambda a: a.id, reverse=True)
+
+        # Image URLs in content (most recent to oldest)
+        image_urls = list(reversed(IMAGE_URL_PATTERN.findall(message.content)))
+
+        if not media_attachments and not image_urls:
+            return
+
+        print(f"👁️ [Passive Image Viewing] Viewing {len(media_attachments) + len(image_urls)} picture(s) in #{ch_name} from {author_name} (most recent to oldest)...")
+
+        # 1. Process attachments from most recent to oldest
+        for attachment in media_attachments:
+            await asyncio.sleep(0.05)
+            if asyncio.current_task().cancelled():
+                raise asyncio.CancelledError()
+
+            mime_type, media_cat = get_media_mime_type(attachment)
+            if media_cat == "image":
+                try:
+                    img_bytes = await attachment.read()
+                    b64_str = process_image_bytes(img_bytes)
+                    desc = await analyze_and_describe_image(
+                        img_bytes, mime_type, attachment.filename, context_hint=message.content
+                    )
+                    if desc:
+                        rec = create_named_visual_record(
+                            attachment.filename, author_name, message, desc, b64_image=b64_str
+                        )
+                        print(f"📷 [Passive Image Viewing] Named {rec['record_name']}: {desc[:80]}...")
+                        try:
+                            emb = await rag_store.embed_text(desc[:1000])
+                            if emb:
+                                rag_store.add_chunk(
+                                    content=f"[{rec['record_name']}]: {desc}",
+                                    embedding=emb,
+                                    source="passive_image_view",
+                                    channel_id=channel.id,
+                                    author=author_name
+                                )
+                        except Exception as e:
+                            print(f"Failed to index passive visual record in RAG: {e}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"Error in passive image view for {attachment.filename}: {e}")
+
+            elif media_cat == "video" and GEMINI_API_KEY:
+                try:
+                    vid_bytes = await attachment.read()
+                    desc = await parse_media_with_gemini(
+                        vid_bytes, mime_type,
+                        prompt=f"Describe what happens in this video clip ({attachment.filename}) in detail."
+                    )
+                    if desc:
+                        rec = create_named_visual_record(
+                            attachment.filename, author_name, message, desc
+                        )
+                        print(f"🎥 [Passive Image Viewing] Named {rec['record_name']}: {desc[:80]}...")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"Error in passive video view for {attachment.filename}: {e}")
+
+        # 2. Process image URLs from most recent to oldest
+        for url in image_urls:
+            await asyncio.sleep(0.05)
+            if asyncio.current_task().cancelled():
+                raise asyncio.CancelledError()
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(url, timeout=10.0)
+                    if resp.status_code == 200:
+                        ext = url.split("?")[0].split(".")[-1].lower()
+                        mime = f"image/{ext}" if ext in ["png", "webp", "gif"] else "image/jpeg"
+                        fn = url.split("/")[-1].split("?")[0] or "web_image.jpg"
+                        b64_str = process_image_bytes(resp.content)
+                        desc = await analyze_and_describe_image(
+                            resp.content, mime, fn, context_hint=message.content
+                        )
+                        if desc:
+                            rec = create_named_visual_record(
+                                fn, author_name, message, desc, b64_image=b64_str
+                            )
+                            print(f"🌐 [Passive Image Viewing] Named {rec['record_name']}: {desc[:80]}...")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"Error in passive view of {url}: {e}")
+
+        print(f"✅ [Passive Image Viewing] Finished in #{ch_name} for message {message.id}")
+
+    except asyncio.CancelledError:
+        print(f"🛑 [Passive Image Viewing] Cancelled in #{ch_name} for message {message.id} to yield to pertinent action.")
+        raise
+    finally:
+        active_passive_view_tasks.pop(channel.id, None)
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-async def get_channel_context(channel, before=None) -> str:
+async def get_channel_context(channel, before=None, limit: int | None = None) -> str:
+    """Builds channel context from the last N messages (default 25), including named visual records."""
+    limit = limit or CONTEXT_MESSAGES
     lines = []
-    async for msg in channel.history(limit=CONTEXT_MESSAGES, before=before):
+    recent_visual_records: list[dict] = []
+
+    async for msg in channel.history(limit=limit, before=before):
         content = msg.content.strip()
+
+        # Check for named visual records associated with this message
+        msg_records = visual_records_by_message.get(msg.id, [])
+        record_tags = []
+        for r in msg_records:
+            record_tags.append(f"[{r['record_name']}: {r['description']}]")
+            recent_visual_records.append(r)
+
+        # Fallback tags if attachments exist but have not been fully described yet
+        if not msg_records and msg.attachments:
+            for a in msg.attachments:
+                mime_type, media_cat = get_media_mime_type(a)
+                if media_cat in ("image", "video"):
+                    record_tags.append(f"[Attached {media_cat}: {a.filename}]")
+
+        if record_tags:
+            content = f"{content} {' '.join(record_tags)}".strip()
+
         if not content:
             continue
+
         # Filter out any error strings, temporary malfunction messages, or broken bot responses from context
         if "Error talking to Ollama" in content or "temporary malfunction" in content or "Couldn't reach Ollama" in content:
             continue
@@ -474,12 +718,38 @@ async def get_channel_context(channel, before=None) -> str:
                 last_line = cleaned_lines[-1].strip()
                 if not last_line.endswith((".", "!", "?", "😊", "✨", "```", ")", "'", '"', ">")):
                     continue  # skip truncated bot response from history context
+
         author = f"{msg.author.display_name} ({msg.author.name})"
         lines.append(f"{author}: {content}")
+
     if not lines:
         return ""
     lines.reverse()
-    return "\n".join(lines)
+
+    context_body = "\n".join(lines)
+
+    # Provide a dedicated named visual records block for the context of 25 messages
+    # Ordered MOST RECENT TO OLDEST
+    if recent_visual_records:
+        recent_visual_records.sort(key=lambda r: r.get("message_id", 0), reverse=True)
+        seen_names = set()
+        record_lines = []
+        for r in recent_visual_records:
+            name = r.get("record_name")
+            if name and name not in seen_names:
+                seen_names.add(name)
+                record_lines.append(
+                    f"• {name} (sent {r.get('timestamp', 'recently')}): {r.get('description', '')}"
+                )
+        if record_lines:
+            records_block = (
+                f"[Named Visual Records in Recent {limit} Messages (Most Recent to Oldest)]:\n"
+                + "\n".join(record_lines)
+                + "\n\n"
+            )
+            return records_block + context_body
+
+    return context_body
 
 
 def load_memory() -> dict:
@@ -1880,19 +2150,26 @@ async def on_message(message: discord.Message):
 
     is_threshold_met = is_monitored and messages_since_last_bot_message[message.channel.id] >= AUTO_RESPONSE_THRESHOLD
 
-    # If none of the triggers are met, exit early
-    if not (is_tagged or is_reply_to_bot or is_threshold_met):
-        await bot.process_commands(message)
-        return
-
-    user_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
-
     # Pre-check if there are attachments or media URLs
     has_potential_media = bool(
         message.attachments
         or IMAGE_URL_PATTERN.search(message.content)
         or VIDEO_URL_PATTERN.search(message.content)
     )
+
+    # If none of the triggers are met, run passive viewing on media in background or exit early
+    if not (is_tagged or is_reply_to_bot or is_threshold_met):
+        if has_potential_media:
+            await cancel_passive_image_viewing(message.channel.id, reason="new passive media arrived")
+            active_passive_view_tasks[message.channel.id] = asyncio.create_task(passive_image_viewer(message))
+        await bot.process_commands(message)
+        return
+
+    # Trigger encountered: cancel passive image viewing immediately to perform the more pertinent action
+    trigger_type = "mention" if is_tagged else ("reply" if is_reply_to_bot else "auto-threshold")
+    await cancel_passive_image_viewing(message.channel.id, reason=f"{trigger_type} trigger")
+
+    user_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
     # If it's a direct user ping/reply with no text and no potential media, prompt the help greeting immediately
     if (is_tagged or is_reply_to_bot) and not user_text and not has_potential_media:
@@ -1905,7 +2182,6 @@ async def on_message(message: discord.Message):
 
     author_name = f"{message.author.display_name} ({message.author.name})"
     ch_name = message.channel.name if hasattr(message.channel, "name") else "DM"
-    trigger_type = "mention" if is_tagged else ("reply" if is_reply_to_bot else "auto-threshold")
     print(f"Received {trigger_type} trigger from {author_name} in #{ch_name}: '{user_text[:100]}'")
 
     # Trigger typing indicator immediately during media downloading, parsing, and LLM generation
@@ -1913,8 +2189,13 @@ async def on_message(message: discord.Message):
         images_list = []
         media_descriptions = []
 
-        # 1. Check attachments (images & videos, up to 5)
-        for attachment in message.attachments[:5]:
+        # 1. Check attachments (images & videos, up to 5) - MOST RECENT TO OLDEST
+        sorted_attachments = sorted(
+            [a for a in message.attachments if get_media_mime_type(a)[1] in ("image", "video")],
+            key=lambda a: a.id,
+            reverse=True
+        )
+        for attachment in sorted_attachments[:5]:
             mime_type, media_cat = get_media_mime_type(attachment)
             if media_cat == "image":
                 try:
@@ -1922,17 +2203,15 @@ async def on_message(message: discord.Message):
                     b64_str = process_image_bytes(img_bytes)
                     if b64_str:
                         images_list.append(b64_str)
-                    # Parse with Gemini upstream parser to get rich visual details
-                    if GEMINI_API_KEY:
-                        prompt = (
-                            f"The user attached this picture ({attachment.filename}) and wrote: '{user_text}'. "
-                            "Describe what is depicted in detail (key subjects, text, objects, colors, atmosphere)."
-                            if user_text else
-                            f"Describe what is depicted in this picture ({attachment.filename}) in detail (subjects, text, objects, atmosphere)."
+                    # Parse image with multimodal Gemini or Ollama vision fallback
+                    parse_res = await analyze_and_describe_image(
+                        img_bytes, mime_type, attachment.filename, context_hint=user_text
+                    )
+                    if parse_res:
+                        rec = create_named_visual_record(
+                            attachment.filename, author_name, message, parse_res, b64_image=b64_str
                         )
-                        parse_res = await parse_media_with_gemini(img_bytes, mime_type, prompt=prompt)
-                        if parse_res:
-                            media_descriptions.append(f"[Picture Attachment ({attachment.filename}) Analysis]:\n{parse_res}")
+                        media_descriptions.append(f"[{rec['record_name']}]:\n{parse_res}")
                 except Exception as e:
                     print(f"Failed to read image attachment {attachment.filename}: {e}")
             elif media_cat == "video":
@@ -1947,14 +2226,17 @@ async def on_message(message: discord.Message):
                         )
                         parse_res = await parse_media_with_gemini(vid_bytes, mime_type, prompt=prompt)
                         if parse_res:
-                            media_descriptions.append(f"[Video Attachment ({attachment.filename}) Analysis]:\n{parse_res}")
+                            rec = create_named_visual_record(
+                                attachment.filename, author_name, message, parse_res
+                            )
+                            media_descriptions.append(f"[{rec['record_name']}]:\n{parse_res}")
                     else:
                         print(f"Cannot parse video attachment {attachment.filename}: GEMINI_API_KEY is not configured.")
                 except Exception as e:
                     print(f"Failed to read video attachment {attachment.filename}: {e}")
 
-        # 2. Check for image URLs pasted in the message content (up to 5)
-        image_url_matches = IMAGE_URL_PATTERN.findall(message.content)
+        # 2. Check for image URLs pasted in the message content (most recent to oldest, up to 5)
+        image_url_matches = list(reversed(IMAGE_URL_PATTERN.findall(message.content)))
         if image_url_matches:
             for url in image_url_matches[:5]:
                 try:
@@ -1964,17 +2246,22 @@ async def on_message(message: discord.Message):
                             b64_str = process_image_bytes(resp.content)
                             if b64_str:
                                 images_list.append(b64_str)
-                            if GEMINI_API_KEY:
-                                ext = url.split("?")[0].split(".")[-1].lower()
-                                mime = f"image/{ext}" if ext in ["png", "webp", "gif"] else "image/jpeg"
-                                parse_res = await parse_media_with_gemini(resp.content, mime, prompt="Describe what is shown in this linked picture:")
-                                if parse_res:
-                                    media_descriptions.append(f"[Linked Picture ({url}) Analysis]:\n{parse_res}")
+                            ext = url.split("?")[0].split(".")[-1].lower()
+                            mime = f"image/{ext}" if ext in ["png", "webp", "gif"] else "image/jpeg"
+                            fn = url.split("/")[-1].split("?")[0] or "web_image.jpg"
+                            parse_res = await analyze_and_describe_image(
+                                resp.content, mime, fn, context_hint=user_text
+                            )
+                            if parse_res:
+                                rec = create_named_visual_record(
+                                    fn, author_name, message, parse_res, b64_image=b64_str
+                                )
+                                media_descriptions.append(f"[{rec['record_name']}]:\n{parse_res}")
                 except Exception as e:
                     print(f"Failed to download image from URL {url}: {e}")
 
-        # 3. Check for video URLs pasted in the message content (up to 3)
-        video_url_matches = VIDEO_URL_PATTERN.findall(message.content)
+        # 3. Check for video URLs pasted in the message content (most recent to oldest, up to 3)
+        video_url_matches = list(reversed(VIDEO_URL_PATTERN.findall(message.content)))
         if video_url_matches:
             for url in video_url_matches[:3]:
                 try:
@@ -1986,9 +2273,25 @@ async def on_message(message: discord.Message):
                                 mime = "video/webm" if ext == "webm" else ("video/quicktime" if ext == "mov" else "video/mp4")
                                 parse_res = await parse_media_with_gemini(resp.content, mime, prompt="Describe what happens in this linked video clip:")
                                 if parse_res:
-                                    media_descriptions.append(f"[Linked Video ({url}) Analysis]:\n{parse_res}")
+                                    rec = create_named_visual_record(
+                                        url.split("/")[-1].split("?")[0] or "web_video",
+                                        author_name, message, parse_res
+                                    )
+                                    media_descriptions.append(f"[{rec['record_name']}]:\n{parse_res}")
                 except Exception as e:
                     print(f"Failed to download video from URL {url}: {e}")
+
+        # 4. If current trigger message didn't contain direct images, pass recent pictures through by most recent to oldest (up to 3)
+        if not images_list and channel_visual_records.get(message.channel.id):
+            recent_cached_images = []
+            for r in channel_visual_records[message.channel.id]:
+                if r.get("b64_image"):
+                    recent_cached_images.append(r["b64_image"])
+                if len(recent_cached_images) >= 3:
+                    break
+            if recent_cached_images:
+                images_list = recent_cached_images
+                print(f"🖼️ Injected {len(images_list)} recent visual record image(s) (most recent to oldest) into prompt payload.")
 
         has_media = bool(images_list or media_descriptions)
 
@@ -2105,6 +2408,9 @@ async def ask(interaction: discord.Interaction, question: str, attachment: disco
     ch_name = interaction.channel.name if hasattr(interaction.channel, "name") else "DM"
     print(f"Slash command /ask executed by {author_name} in #{ch_name}: '{question[:100]}'")
 
+    # Cancel any active passive image viewing in this channel immediately to prioritize /ask
+    await cancel_passive_image_viewing(interaction.channel_id, reason="slash command /ask")
+
     images_list = []
     media_descriptions = []
     if attachment:
@@ -2115,13 +2421,14 @@ async def ask(interaction: discord.Interaction, question: str, attachment: disco
                 b64_str = process_image_bytes(img_bytes)
                 if b64_str:
                     images_list.append(b64_str)
-                if GEMINI_API_KEY:
-                    parse_res = await parse_media_with_gemini(
-                        img_bytes, mime_type,
-                        prompt=f"The user attached this picture ({attachment.filename}) and asked: '{question}'. Describe what is shown in detail to answer the user."
+                parse_res = await analyze_and_describe_image(
+                    img_bytes, mime_type, attachment.filename, context_hint=question
+                )
+                if parse_res:
+                    rec = create_named_visual_record(
+                        attachment.filename, author_name, interaction, parse_res, b64_image=b64_str
                     )
-                    if parse_res:
-                        media_descriptions.append(f"[Picture Attachment ({attachment.filename}) Analysis]:\n{parse_res}")
+                    media_descriptions.append(f"[{rec['record_name']}]:\n{parse_res}")
             except Exception as e:
                 print(f"Failed to read image attachment in /ask: {e}")
         elif media_cat == "video":
@@ -2133,9 +2440,24 @@ async def ask(interaction: discord.Interaction, question: str, attachment: disco
                         prompt=f"The user attached this video clip ({attachment.filename}) and asked: '{question}'. Describe what happens in detail to answer the user."
                     )
                     if parse_res:
-                        media_descriptions.append(f"[Video Attachment ({attachment.filename}) Analysis]:\n{parse_res}")
+                        rec = create_named_visual_record(
+                            attachment.filename, author_name, interaction, parse_res
+                        )
+                        media_descriptions.append(f"[{rec['record_name']}]:\n{parse_res}")
             except Exception as e:
                 print(f"Failed to read video attachment in /ask: {e}")
+
+    # If no direct attachment in /ask, inject recent images from context (most recent to oldest)
+    if not images_list and channel_visual_records.get(interaction.channel_id):
+        recent_cached_images = []
+        for r in channel_visual_records[interaction.channel_id]:
+            if r.get("b64_image"):
+                recent_cached_images.append(r["b64_image"])
+            if len(recent_cached_images) >= 3:
+                break
+        if recent_cached_images:
+            images_list = recent_cached_images
+            print(f"🖼️ [/ask] Injected {len(images_list)} recent visual record image(s) (most recent to oldest).")
 
     context = await get_channel_context(interaction.channel)
     reply = await query_ollama(

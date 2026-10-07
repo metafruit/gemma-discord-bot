@@ -30,5 +30,12 @@ if [[ -z "${DISCORD_TOKEN:-}" ]]; then
   exit 1
 fi
 
+if [[ -z "${SSL_CERT_FILE:-}" ]]; then
+  CERT_PATH="$(/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -m certifi 2>/dev/null || true)"
+  if [[ -n "$CERT_PATH" ]]; then
+    export SSL_CERT_FILE="$CERT_PATH"
+  fi
+fi
+
 export GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 exec /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -u bot.py >> "$SCRIPT_DIR/bot.log" 2>&1
